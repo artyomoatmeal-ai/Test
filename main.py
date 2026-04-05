@@ -1,108 +1,137 @@
-import requests
+import asyncio
+import httpx
 import random
 import string
-import time
 import re
+import time
+from datetime import datetime
 
-# Предкомпилированные регулярки и константы
-BASE_URL = "https://millymods.duckdns.org"
-CAPTCHA_RE = re.compile(r'Captcha:\s*(\d+)\s*\+\s*(\d+)')
-RANDOM_CHARS = string.ascii_lowercase + string.digits
+CAPTCHA_RE = re.compile(r'Captcha:\s*(\d+)\s*\+\s*(\d+)', re.IGNORECASE | re.DOTALL)
 
-SESSION_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-}
-
-def random_str(length=8):
-    return ''.join(random.choices(RANDOM_CHARS, k=length))
+def random_str(length: int = 8) -> str:
+    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
 
-def run_test(session):
-    username = f"bot_{random_str(6)}"
+async def run_single_test(client: httpx.AsyncClient, iteration: int, log_file):
+    base_url = "https://millymods.duckdns.org"
+    username = f"bot_{random_str(8)}"
     password = "password123"
-
-    # === Регистрация ===
-    reg_data = {'username': username, 'password': password}
-    r = session.post(f"{BASE_URL}/register", data=reg_data, allow_redirects=True, timeout=10)
-    if r.status_code not in (200, 302):
-        print(f"[!] Reg failed {username}: {r.status_code}")
-        return False
-
-    # === Логин ===
-    login_data = {'username': username, 'password': password}
-    r = session.post(f"{BASE_URL}/login", data=login_data, allow_redirects=True, timeout=10)
-    if r.status_code not in (200, 302):
-        print(f"[!] Login failed {username}: {r.status_code}")
-        return False
-
-    # === Получаем страницу submit (самый критичный момент по скорости) ===
-    r = session.get(f"{BASE_URL}/submit", timeout=10)
-    if r.status_code != 200 or "/login" in r.url:
-        print(f"[!] Not authorized after login: {username}")
-        return False
-
-    # Быстрый парсинг капчи без BeautifulSoup
-    match = CAPTCHA_RE.search(r.text)
-    if not match:
-        print(f"[!] Captcha not found for {username}")
-        return False
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     try:
-        x, y = map(int, match.groups())
-        answer = x + y
-    except Exception:
-        print(f"[!] Failed to solve captcha for {username}")
-        return False
+        # 1. Регистрация
+        await client.post(
+            f"{base_url}/register",
+            data={'username': username, 'password': password},
+            follow_redirects=True
+        )
 
-    # === Отправка скрипта ===
-    submit_data = {
-        'name': f"Test {random_str(4).upper()}",
-        'nickname': f"Bot_{username[-8:]}",        # короче = чуть быстрее
-        'description': f"Auto test {random_str(12)}",
-        'captcha': str(answer)
-    }
+        # 2. Логин
+        await client.post(
+            f"{base_url}/login",
+            data={'username': username, 'password': password},
+            follow_redirects=True
+        )
 
-    files = {
-        'file': ('test.lua', b'-- Auto test\nfrom ' + username.encode() + b'\nprint("Hello")')
-    }
+        # 3. Получаем страницу сабмита
+        r = await client.get(f"{base_url}/submit", follow_redirects=True)
 
-    r = session.post(f"{BASE_URL}/submit", data=submit_data, files=files, 
-                     allow_redirects=True, timeout=15)
+        # Исправленная проверка авторизации (защита от AttributeError)
+        final_url = str(r.url).lower()
+        if "/login" in final_url or r.status_code != 200:
+            return False, "auth_failed"
 
-    if r.status_code == 200:
-        print(f"[+] Success: {username}")
-        return True
-    else:
-        print(f"[!] Submit failed {username}: {r.status_code}")
-        return False
+        # 4. Решаем капчу
+        match = CAPTCHA_RE.search(r.text)
+        if not match:
+            return False, "captcha_not_found"
+
+        answer = int(match.group(1)) + int(match.group(2))
+
+        # 5. Сабмит
+        submit_data = {
+            'name': f"TS{random_str(4).upper()}",
+            'nickname': username[:15],
+            'description': f"stress_{iteration}",
+            'captcha': str(answer)
+        }
+
+        files = {
+            'file': ('t.lua', b'-- stress test')
+        }
+
+        r = await client.post(
+            f"{base_url}/submit",
+            data=submit_data,
+            files=files,
+            follow_redirects=True
+        )
+
+        success = r.status_code in (200, 302)
+
+        if success:
+            log_line = f"[{timestamp}] SUCCESS | Username: {username} | Password: {password}\n"
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(log_line)
+            print(f"[+] Создан → {username}")
+        else:
+            print(f"[-] Сабмит не удался: {username} (status {r.status_code})")
+
+        return success, r.status_code
+
+    except Exception as e:
+        print(f"[!] Ошибка с {username}: {type(e).__name__} - {e}")
+        return False, "exception"
+
+
+async def main(max_concurrency: int = 40):
+    log_file = "created_accounts.log"
+    
+    with open(log_file, "w", encoding="utf-8") as f:
+        f.write("=== MILLYMODS CREATED ACCOUNTS LOG ===\n")
+        f.write(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+
+    print("=== FIXED ULTRA FAST TESTER + LOGGER ===")
+    print(f"Concurrency: {max_concurrency}")
+    print(f"Логи → {log_file}")
+    print("Ctrl+C для остановки\n")
+
+    limits = httpx.Limits(max_connections=250, max_keepalive_connections=120)
+    timeout = httpx.Timeout(15.0, connect=8.0)
+
+    async with httpx.AsyncClient(
+        limits=limits,
+        timeout=timeout,
+        follow_redirects=True,
+        http2=False
+    ) as client:
+        
+        iteration = 0
+        success_count = 0
+        start_time = time.perf_counter()
+
+        while True:
+            tasks = [run_single_test(client, iteration + i + 1, log_file) 
+                    for i in range(max_concurrency)]
+            
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            iteration += max_concurrency
+            for res in results:
+                if isinstance(res, tuple) and res[0] is True:
+                    success_count += 1
+
+            if iteration % 80 == 0:
+                elapsed = time.perf_counter() - start_time
+                rate = iteration / elapsed if elapsed > 0 else 0
+                print(f"\r[STATS] #{iteration:05d} | Успешно: {success_count} | Скорость: {rate:.1f} акк/сек", 
+                      end="", flush=True)
 
 
 if __name__ == "__main__":
-    print("=== MILLYMODS FAST STRESS TEST ===")
-    print("Target:", BASE_URL)
-    print("Press Ctrl+C to stop.\n")
-
-    count = 0
-    session = None
-
     try:
-        while True:
-            count += 1
-            print(f"\n--- [{count:04d}] ---")
-
-            # Создаём новый Session для каждого теста (чище + меньше памяти со временем)
-            session = requests.Session()
-            session.headers.update(SESSION_HEADERS)
-
-            start = time.perf_counter()
-            success = run_test(session)
-            elapsed = time.perf_counter() - start
-
-            print(f"    Time: {elapsed:.3f}s  |  Status: {'OK' if success else 'FAIL'}")
-
-            time.sleep(0.8)  # можно уменьшить до 0.5–0.6, если сервер выдержит
-
+        asyncio.run(main(max_concurrency=40))   # начни с 40, потом поднимай
     except KeyboardInterrupt:
-        print("\n\n[!] Stopped by user.")
+        print("\n\n[!] Остановлено.")
     except Exception as e:
-        print(f"\n[!!] Critical error: {e}")
+        print(f"\n[!] Критическая ошибка: {e}")
